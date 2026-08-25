@@ -1211,25 +1211,50 @@ def send_reaction(
         return False, f"Unexpected error: {str(e)}"
 
 
-def mark_messages_read(
-    message_ids: list[str],
+def mark_as_read(
     chat_jid: str,
+    message_id: str = "",
+    message_ids: list[str] | None = None,
     sender_jid: str = "",
     timestamp: str | None = None,
 ) -> tuple[bool, str]:
-    """Mark selected messages as read through the WhatsApp bridge."""
+    """Mark one or more WhatsApp messages as read (blue ticks / read receipt).
+
+    Args:
+        chat_jid: The chat JID (DM or group).
+        message_id: Single message ID to mark read.
+        message_ids: Optional list of message IDs (same sender only).
+        sender_jid: Required for group chats — JID of who sent the message(s).
+                    Optional in DMs.
+        timestamp: Optional RFC 3339 read timestamp; defaults to now on the bridge.
+
+    Returns:
+        Tuple of (success, status_message).
+    """
     try:
-        normalized_ids = [message_id.strip() for message_id in message_ids]
-        if not normalized_ids or any(not message_id for message_id in normalized_ids):
-            return False, "At least one non-empty message ID must be provided"
         if not chat_jid:
-            return False, "Chat JID must be provided"
+            return False, "chat_jid must be provided"
+
+        ids: list[str] = []
+        if message_ids:
+            ids.extend([mid.strip() for mid in message_ids if mid and mid.strip()])
+        if message_id and message_id.strip():
+            ids.append(message_id.strip())
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for mid in ids:
+            if mid not in seen:
+                seen.add(mid)
+                unique.append(mid)
+        if not unique:
+            return False, "message_id or message_ids must be provided"
         if chat_jid.endswith("@g.us") and not sender_jid:
-            return False, "Sender JID must be provided for group read receipts"
+            return False, "sender_jid must be provided for group read receipts"
 
         payload: dict[str, Any] = {
-            "message_ids": normalized_ids,
             "chat_jid": chat_jid,
+            "message_ids": unique,
         }
         if sender_jid:
             payload["sender_jid"] = sender_jid
@@ -1244,7 +1269,9 @@ def mark_messages_read(
 
         if response.status_code == 200:
             result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
+            if result.get("success"):
+                return True, result.get("message", "Marked as read")
+            return False, result.get("message", "Unknown error")
         return False, f"Error: HTTP {response.status_code} - {response.text}"
 
     except requests.RequestException as e:
