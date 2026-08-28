@@ -9,6 +9,7 @@ from typing import Any
 import requests
 
 import audio
+import staff_signoff
 
 # Configuration via environment variables with sensible defaults
 _DEFAULT_BRIDGE_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store")
@@ -1051,6 +1052,8 @@ def send_message(
         if not recipient:
             return False, "Recipient must be provided"
 
+        message = staff_signoff.apply_staff_signoff(message, recipient)
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload: dict[str, Any] = {
             "recipient": recipient,
@@ -1097,6 +1100,9 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> tuple[bool,
 
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
+
+        if caption:
+            caption = staff_signoff.apply_staff_signoff(caption, recipient)
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "media_path": media_path}
