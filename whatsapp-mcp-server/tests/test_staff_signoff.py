@@ -48,4 +48,25 @@ def test_state_file_by_jid(monkeypatch, tmp_path):
         staff_signoff.lookup_staff_signoff("120363412265017299@g.us")
         == "- Webby (Luna - high)"
     )
-    assert staff_signoff.lookup_staff_signoff("other@g.us") == "- Webby (Luna - high)"
+    assert staff_signoff.lookup_staff_signoff("other@g.us") == ""
+
+
+def test_never_borrows_another_chats_signoff(monkeypatch, tmp_path):
+    """A chat with no row of its own gets no stamp, never a neighbour's."""
+    path = tmp_path / "staff-signoff.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hex-chat@g.us": {"signoff": "- Hex (Sol 5.6 - high)", "ts": 9999999999},
+                "webby-chat@g.us": {"signoff": "- Webby (Luna - high)", "ts": 9999999999},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HW_STAFF_SIGNOFF", raising=False)
+    monkeypatch.setenv("HW_STAFF_SIGNOFF_FILE", str(path))
+    assert staff_signoff.lookup_staff_signoff("bbs-chat@g.us") == ""
+    assert staff_signoff.apply_staff_signoff("On it.\n\n- Chris", "bbs-chat@g.us") == (
+        "On it.\n\n- Chris"
+    )
+    assert staff_signoff.lookup_staff_signoff("hex-chat@g.us") == "- Hex (Sol 5.6 - high)"

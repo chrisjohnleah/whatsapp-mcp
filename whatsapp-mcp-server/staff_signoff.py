@@ -46,16 +46,8 @@ def lookup_staff_signoff(recipient: str = "") -> str:
         sign = str(row.get("signoff") or "").strip()
         if sign and now - ts <= _MAX_AGE_S:
             return sign
-    fresh: list[str] = []
-    for item in data.values():
-        if not isinstance(item, dict):
-            continue
-        ts = float(item.get("ts") or 0)
-        sign = str(item.get("signoff") or "").strip()
-        if sign and now - ts <= _MAX_AGE_S:
-            fresh.append(sign)
-    if len(set(fresh)) == 1:
-        return fresh[0]
+    # No row for this chat means no stamp. Borrowing another chat's sign-off
+    # put "- Hex (Sol 5.6 - high)" on a BBS client message on 29 Aug 2026.
     return ""
 
 
