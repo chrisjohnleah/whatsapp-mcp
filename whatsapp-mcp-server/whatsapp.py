@@ -510,7 +510,10 @@ def list_messages(
         # Add sorting and pagination
         offset = page * limit
         order = "DESC" if sort_by == "newest" else "ASC"
-        query_parts.append(f"ORDER BY messages.timestamp {order}")
+        # Timestamps carry the bridge host's UTC offset; ordering the raw text is
+        # only chronological while that offset never changes. julianday() orders
+        # on the instant (see also get_message_context / list_chats).
+        query_parts.append(f"ORDER BY julianday(messages.timestamp) {order}")
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
 
@@ -604,8 +607,8 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
             SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.chat_jid = ? AND messages.timestamp < ?
-            ORDER BY messages.timestamp DESC
+            WHERE messages.chat_jid = ? AND julianday(messages.timestamp) < julianday(?)
+            ORDER BY julianday(messages.timestamp) DESC
             LIMIT ?
         """,
             (msg_data[7], msg_data[0], before),
@@ -634,8 +637,8 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
             SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.chat_jid = ? AND messages.timestamp > ?
-            ORDER BY messages.timestamp ASC
+            WHERE messages.chat_jid = ? AND julianday(messages.timestamp) > julianday(?)
+            ORDER BY julianday(messages.timestamp) ASC
             LIMIT ?
         """,
             (msg_data[7], msg_data[0], after),
@@ -721,7 +724,7 @@ def list_chats(
             query_parts.append("WHERE " + " AND ".join(where_clauses))
 
         # Add sorting
-        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
+        order_by = "julianday(chats.last_message_time) DESC" if sort_by == "last_active" else "chats.name"
         query_parts.append(f"ORDER BY {order_by}")
 
         # Add pagination
@@ -860,7 +863,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
                 WHERE contact_msg.chat_jid = c.jid
                     AND contact_msg.sender IN ({placeholders})
             ) OR c.jid = ?
-            ORDER BY c.last_message_time DESC
+            ORDER BY julianday(c.last_message_time) DESC
             LIMIT ? OFFSET ?
         """,
             (*aliases, jid, limit, page * limit),
@@ -920,7 +923,7 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
             WHERE m.sender IN ({placeholders}) OR c.jid = ?
-            ORDER BY m.timestamp DESC
+            ORDER BY julianday(m.timestamp) DESC
             LIMIT 1
         """,
             (*aliases, jid),
