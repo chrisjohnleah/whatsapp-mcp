@@ -215,6 +215,27 @@ def test_mark_as_read_validates_input(chat_jid, message_ids, sender_jid, expecte
     assert expected_message in message
 
 
+def test_send_message_blocks_internal_protocol(monkeypatch):
+    """KF MES 2026-09-18: WAKE_RESULT must never reach /api/send."""
+    calls = []
+    monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
+
+    def fake_post(url, json, headers=None):
+        calls.append({"url": url, "json": json})
+        return DummyResponse()
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+
+    success, message = whatsapp.send_message(
+        "120363402197392919@g.us",
+        "WAKE_RESULT: handled\nSENT: yes\nwhatsapp-business__send_message(content=\"hi\")",
+    )
+
+    assert success is False
+    assert "outbound blocked" in message
+    assert calls == []
+
+
 def test_send_message_with_quoted_reply_includes_quote_fields(monkeypatch):
     """send_message passes quoted_message_id, quoted_sender_jid, quoted_content to /api/send."""
     calls = []

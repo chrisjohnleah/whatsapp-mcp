@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -2259,6 +2260,34 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + parts[1]
 }
 
+// internalProtocolRe matches staff-wake footers and fake MCP tool calls.
+// KF MES 2026-09-18: Gemma dumped this as a customer bubble via /api/send.
+var internalProtocolRe = regexp.MustCompile(`(?im)` +
+	`(^WAKE_RESULT\s*:)` +
+	`|(^SENT\s*:\s*(yes|no)\b)` +
+	`|(^VERIFIED\s*:)` +
+	`|(^OPEN_ITEMS\s*:)` +
+	`|(^ARTIFACTS\s*:)` +
+	`|(^OBJECTIVE\s*:)` +
+	`|(^EVIDENCE\s*:)` +
+	`|(whatsapp-business__)` +
+	`|(whatsapp__send)` +
+	`|(send_message\s*\()` +
+	`|(quoted_message_id\s*=)`)
+
+func internalProtocolReason(message string) string {
+	m := internalProtocolRe.FindStringSubmatch(message)
+	if m == nil {
+		return ""
+	}
+	for _, g := range m[1:] {
+		if g != "" {
+			return g
+		}
+	}
+	return strings.TrimSpace(m[0])
+}
+
 // Start a REST API server to expose the WhatsApp client functionality.
 //
 // Auth: every handler is wrapped in withAuth, which enforces both a
@@ -2318,6 +2347,20 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 		if req.Message == "" && req.MediaPath == "" {
 			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+			return
+		}
+
+		// KF MES 2026-09-18: Gemma pasted WAKE_RESULT / send_message(...) into
+		// Jake's group via /api/send. Never deliver staff-wake protocol.
+		if reason := internalProtocolReason(req.Message); reason != "" {
+			fmt.Printf("← /api/send blocked internal protocol reason=%q recipient=%q\n",
+				reason, req.Recipient)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "outbound blocked: internal protocol",
+			})
 			return
 		}
 

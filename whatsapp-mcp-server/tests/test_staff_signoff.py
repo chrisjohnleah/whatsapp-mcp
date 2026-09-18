@@ -70,3 +70,16 @@ def test_never_borrows_another_chats_signoff(monkeypatch, tmp_path):
         "On it.\n\n- Chris"
     )
     assert staff_signoff.lookup_staff_signoff("hex-chat@g.us") == "- Hex (Sol 5.6 - high)"
+
+
+def test_internal_protocol_reason_blocks_wake_footer():
+    leak = (
+        "WAKE_RESULT: handled\n"
+        "SENT: yes\n"
+        "OPEN_ITEMS: #2276\n"
+        'whatsapp-business__send_message(content="Got it.")\n'
+    )
+    assert staff_signoff.internal_protocol_reason(leak)
+    assert not staff_signoff.internal_protocol_reason(
+        "Got it. Glad that sorted it.\n\n- Webby (Gemma 4 e4b)"
+    )

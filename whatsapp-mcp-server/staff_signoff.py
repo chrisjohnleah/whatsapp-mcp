@@ -13,6 +13,34 @@ import time
 from pathlib import Path
 
 _SIGN_LINE = re.compile(r"^[-—–]\s+\S")
+_PROTOCOL_RE = re.compile(
+    r"(?im)"
+    r"(^WAKE_RESULT\s*:)"
+    r"|(^SENT\s*:\s*(yes|no)\b)"
+    r"|(^VERIFIED\s*:)"
+    r"|(^OPEN_ITEMS\s*:)"
+    r"|(^ARTIFACTS\s*:)"
+    r"|(^OBJECTIVE\s*:)"
+    r"|(^EVIDENCE\s*:)"
+    r"|(whatsapp-business__)"
+    r"|(whatsapp__send)"
+    r"|(send_message\s*\()"
+    r"|(quoted_message_id\s*=)"
+)
+
+
+def internal_protocol_reason(message: str) -> str:
+    """Staff-wake footer / fake MCP call — never a customer bubble.
+
+    KF MES 2026-09-18: Gemma posted WAKE_RESULT + send_message(...) to Jake.
+    """
+    if not message:
+        return ""
+    m = _PROTOCOL_RE.search(message)
+    if not m:
+        return ""
+    hit = next((g for g in m.groups() if g), m.group(0))
+    return (hit or "").strip()[:80]
 _STATE_DEFAULT = (
     Path.home()
     / "Library/Application Support/happywebs-employees-runtime/staff-signoff.json"

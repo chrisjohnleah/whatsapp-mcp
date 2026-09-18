@@ -1053,6 +1053,9 @@ def send_message(
             return False, "Recipient must be provided"
 
         message = staff_signoff.apply_staff_signoff(message, recipient)
+        reason = staff_signoff.internal_protocol_reason(message)
+        if reason:
+            return False, "outbound blocked: internal protocol"
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload: dict[str, Any] = {
@@ -1103,6 +1106,8 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> tuple[bool,
 
         if caption:
             caption = staff_signoff.apply_staff_signoff(caption, recipient)
+            if staff_signoff.internal_protocol_reason(caption):
+                return False, "outbound blocked: internal protocol"
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "media_path": media_path}

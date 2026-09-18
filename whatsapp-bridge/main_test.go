@@ -2671,6 +2671,36 @@ func TestSendHandler_QuotedReplyFields_PassedThrough(t *testing.T) {
 	}
 }
 
+func TestInternalProtocolReason(t *testing.T) {
+	leak := "WAKE_RESULT: handled\nSENT: yes\nwhatsapp-business__send_message(content=\"hi\")\n"
+	if got := internalProtocolReason(leak); got == "" {
+		t.Fatalf("expected protocol hit, got empty")
+	}
+	clean := "Got it. Glad that sorted it.\n\n- Webby (Gemma 4 e4b)"
+	if got := internalProtocolReason(clean); got != "" {
+		t.Fatalf("clean customer line blocked: %q", got)
+	}
+}
+
+func TestSendHandler_InternalProtocol_Forbidden(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	body := `{"recipient":"120363402197392919@g.us","message":"WAKE_RESULT: handled\nSENT: yes"}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/send", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for protocol dump, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "outbound blocked") {
+		t.Fatalf("expected blocked message, got %s", resp.Body.String())
+	}
+}
+
 // TestExtractQuotedMessageInfo_ExtendedText verifies the helper that the
 // bridge uses to parse quoted-reply ContextInfo from inbound messages.
 func TestExtractQuotedMessageInfo_ExtendedText(t *testing.T) {
