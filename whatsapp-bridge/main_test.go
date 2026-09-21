@@ -2265,6 +2265,22 @@ func TestHandleMessage_ReactionWithoutKey_NotStored(t *testing.T) {
 
 // TestReactHandler_MissingFields_Returns400 verifies that the /api/react
 // handler returns 400 when recipient or message_id is absent.
+func TestReactionTargetsUsesLIDAndClearsPhoneToo(t *testing.T) {
+	phone := types.JID{User: "447817252183", Server: types.DefaultUserServer}
+	lid := types.JID{User: "264338191433846", Server: types.HiddenUserServer}
+	add := reactionTargets(phone, lid, false)
+	if len(add) != 1 || add[0].Server != types.HiddenUserServer {
+		t.Fatalf("add = %+v, want only the LID", add)
+	}
+	clear := reactionTargets(phone, lid, true)
+	if len(clear) != 2 || clear[0].Server != types.HiddenUserServer || clear[1].User != phone.User {
+		t.Fatalf("clear = %+v, want LID then phone", clear)
+	}
+	if got := reactionTargets(phone, types.EmptyJID, true); len(got) != 1 || got[0].User != phone.User {
+		t.Fatalf("no lid = %+v", got)
+	}
+}
+
 func TestReactHandler_MissingFields_Returns400(t *testing.T) {
 	const token = "supersecrettoken1234567890abcdef"
 	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)

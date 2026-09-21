@@ -1103,6 +1103,27 @@ type ReactRequest struct {
 	Emoji     *string `json:"emoji"`      // reaction emoji; empty string removes the reaction
 }
 
+// reactionTargets is who a reaction must name as the message author.
+// Live group keys use the sender's LID. Callers pass the phone JID they
+// stored. Sending the clear only at the phone JID leaves the eyes on the
+// LID key, which is what Chris sees on his own bubbles.
+// A clear also addresses the phone JID so a reaction added before this
+// mapping comes off.
+func reactionTargets(sender, lid types.JID, clearing bool) []types.JID {
+	sender = sender.ToNonAD()
+	if sender.Server != types.DefaultUserServer || lid.IsEmpty() {
+		return []types.JID{sender}
+	}
+	lid = lid.ToNonAD()
+	if lid.Server != types.HiddenUserServer || lid.User == "" || lid.User == sender.User {
+		return []types.JID{sender}
+	}
+	if !clearing {
+		return []types.JID{lid}
+	}
+	return []types.JID{lid, sender}
+}
+
 // classifyMediaPath maps a file extension to (whatsmeow upload type, MIME
 // type, persist-side category). Single source of truth for the upload path
 // (which needs the whatsmeow.MediaType + MIME) and the SQLite persist path
@@ -2555,11 +2576,31 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			}
 			senderJID = chatJID
 		}
-		msg := client.BuildReaction(chatJID, senderJID, req.MessageID, *req.Emoji)
+		targets := []types.JID{senderJID}
+		if client.Store != nil && client.Store.LIDs != nil {
+			if lid, err := client.Store.LIDs.GetLIDForPN(r.Context(), senderJID); err == nil {
+				targets = reactionTargets(senderJID, lid, *req.Emoji == "")
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		if _, err := client.SendMessage(context.Background(), chatJID, msg); err != nil {
+		var sendErr error
+		sent := 0
+		for _, participant := range targets {
+			msg := client.BuildReaction(chatJID, participant, req.MessageID, *req.Emoji)
+			if _, err := client.SendMessage(context.Background(), chatJID, msg); err != nil {
+				sendErr = err
+				fmt.Printf("react failed participant=%s msg=%s: %v\n", participant, req.MessageID, err)
+				continue
+			}
+			sent++
+		}
+		if sent == 0 {
 			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			errText := "react failed"
+			if sendErr != nil {
+				errText = sendErr.Error()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": errText})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
