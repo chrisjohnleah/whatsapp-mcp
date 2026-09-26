@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/rand"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,7 +21,6 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -3041,17 +3041,19 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	return mux
 }
 
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string) {
+// startRESTServer serves on a listener that main already bound (see
+// bindBridgePort). Binding is not done here: by this point the WhatsApp session
+// is live, so discovering a port clash now would be too late to back out of it
+// without having already evicted a running bridge.
+func startRESTServer(listener net.Listener, client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string) {
 	handler := newRESTMux(client, messageStore, port, token, allowedMediaRoots)
 
-	// Start the server with proper timeouts. Bind to loopback so the bridge is
-	// not reachable from the LAN; MCP clients talk to it over localhost.
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// The listener is already bound to loopback, so the bridge is not reachable
+	// from the LAN; MCP clients talk to it over localhost.
+	fmt.Printf("Starting REST API server on %s...\n", listener.Addr())
 
 	// Create server with timeouts for stability
 	server := &http.Server{
-		Addr:         serverAddr,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second, // Longer for media downloads
 		IdleTimeout:  120 * time.Second,
@@ -3060,7 +3062,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -3143,6 +3145,28 @@ func main() {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
+
+	// Claim the store and the REST port before opening the session database or
+	// dialling WhatsApp. A second bridge that gets as far as connecting would
+	// evict the running one from the shared device session (see singleton.go).
+	port, err := resolveBridgePort()
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
+	}
+	lockFile, err := acquireBridgeLock("store")
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
+	}
+	defer func() { _ = lockFile.Close() }()
+
+	restListener, err := bindBridgePort(port)
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
+	}
+	logger.Infof("Bridge lock acquired; REST API bound to %s", restListener.Addr())
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -3232,19 +3256,9 @@ func main() {
 		return
 	}
 
-	// Resolve the REST API port. Pure env parsing with no dependency on the
-	// WhatsApp connection, so it's safe to do this early alongside the token
-	// load below — and failing fast here means we don't run a QR-pairing
-	// flow only to error out on an invalid port afterwards.
-	port := 8080
-	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
-		v, err := strconv.Atoi(p)
-		if err != nil || v < 1 || v > 65535 {
-			logger.Errorf("Invalid WHATSAPP_BRIDGE_PORT=%q, must be 1-65535", p)
-			return
-		}
-		port = v
-	}
+	// Port and the loopback listener were claimed above, before the session
+	// database was opened. The token still has to be ready before the event
+	// handler is registered.
 
 	// Load (or generate on first run) the bearer token used to authenticate
 	// REST callers, and attach it to outbound webhook POSTs so the hub's
@@ -3548,7 +3562,7 @@ connectionSuccess:
 	}
 	logger.Infof("Allowed media roots: %v", allowedMediaRoots)
 
-	startRESTServer(client, messageStore, port, bridgeToken, allowedMediaRoots)
+	startRESTServer(restListener, client, messageStore, port, bridgeToken, allowedMediaRoots)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -3936,21 +3950,32 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// Determine sender. History-sync rows do not carry SenderAlt,
 				// so any LID-based participant is resolved through the
 				// whatsmeow LID store (populated during live message handling).
+				// Group senders live in the top-level WebMessageInfo.participant
+				// field on modern history syncs; Key.Participant is only a legacy
+				// fallback. Participant is only consulted for group and broadcast
+				// chats. For a one-to-one chat the sender is the chat itself.
 				var sender string
 				isFromMe := false
 				if msg.Message.Key != nil {
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
+					var participant string
+					if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer && jid.Server != types.NewsletterServer {
+						participant = msg.Message.GetParticipant()
+						if participant == "" {
+							participant = msg.Message.Key.GetParticipant()
+						}
+					}
 					var rawSender types.JID
 					switch {
 					case isFromMe && client.Store.ID != nil:
 						rawSender = client.Store.ID.ToNonAD()
-					case msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "":
-						if parsed, perr := types.ParseJID(*msg.Message.Key.Participant); perr == nil {
+					case participant != "":
+						if parsed, perr := types.ParseJID(participant); perr == nil {
 							rawSender = parsed
 						} else {
-							rawSender = types.JID{User: *msg.Message.Key.Participant}
+							rawSender = types.JID{User: participant}
 						}
 					default:
 						rawSender = jid

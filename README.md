@@ -1071,6 +1071,12 @@ are documented in [docs/RELEASING.md](docs/RELEASING.md).
   supported linked-device client version, which can make older whatsmeow builds
   fail before pairing completes.
 - **QR Code Not Displaying**: Restart the bridge. Check terminal QR code support.
+  If the terminal drawing will not scan, open `store/qr.png` (the bridge writes
+  it on every code and tries to open it once).
+- **Bridge exits saying another bridge holds `store/.bridge.lock`**: A second
+  process on the same store would log the running one out of WhatsApp. Stop the
+  extra process. Personal and business bridges are fine together when each has
+  its own working directory and store.
 - **Phone says "check your connection" after scanning**: WhatsApp answers a scan
   with a `companion_reg_refresh` notification, whatsmeow rotates the pairing
   secret, and the bridge prints a **new** QR code marked `QR code refreshed`.
