@@ -314,6 +314,69 @@ only helps a client that can read the filesystem — use `view_media` otherwise.
 - `message_id` (required): ID of the message with media
 - `chat_jid` (required): JID of the chat containing the message
 
+### Typing/Presence Operations
+
+#### `get_typing_state`
+
+Query inbound typing/composing state for WhatsApp chats.
+
+Returns contacts who are currently typing or recording a voice message.
+Useful for detecting when a contact is composing a message before responding
+(e.g., to avoid sending a reaction while they're still typing).
+
+**Parameters:**
+
+- `chat_jid` (optional): Filter results to a specific chat. If not provided,
+  returns all currently-typing contacts across all chats.
+
+**Returns:**
+
+```jsonc
+{
+  "success": true,
+  "typing": [
+    {
+      "chat_jid": "1234567890@s.whatsapp.net",
+      "sender_jid": "9876543210@s.whatsapp.net",
+      "is_typing": true,
+      "media": "",        // "" for text, "audio" for voice recording
+      "updated_at": "2024-01-15T10:30:00Z"
+    }
+  ]
+}
+```
+
+**How it works:**
+
+The bridge marks itself as "available" on connection so that WhatsApp sends
+typing notifications (`events.ChatPresence`). Composing states are tracked
+in-memory and expire after ~30 seconds if no "paused" event arrives.
+
+**Natural Language Examples:**
+
+- "Is anyone typing in the customer support chat?"
+- "Check if the user is composing a message before I react"
+- "Who is currently typing across all my chats?"
+
+**Webhook Integration:**
+
+When `WEBHOOK_URL` is set, typing events are forwarded as they happen:
+
+```json
+{
+  "eventType": "typing",
+  "chatJID": "1234567890@s.whatsapp.net",
+  "senderJID": "9876543210@s.whatsapp.net",
+  "isTyping": true,
+  "media": "",
+  "timestamp": 1705315800
+}
+```
+
+Events are sent for both compose start (`isTyping: true`) and stop
+(`isTyping: false`). The webhook respects the same `WEBHOOK_ENABLED` and
+`X-Bridge-Token` authentication as message webhooks.
+
 #### `view_media`
 
 View the media of a message as an image, for clients with no filesystem access
@@ -808,6 +871,15 @@ Caveats:
 - **Only effective on a fresh pair.** With `whatsapp.db` already present, no new pair handshake fires and the flag is a no-op.
 - **Messages the phone has deleted are not recoverable** — auto-expire, low-storage cleanup, and manual delete all leave no trace for the phone to share.
 
+### Expired attachment downloads
+
+When a stored attachment link returns HTTP 403, 404, or 410, the bridge asks
+your primary phone to refresh that attachment, saves the renewed download path,
+and retries once. Keep the phone online with WhatsApp available. The request
+has a 50-second total timeout; a phone that no longer has the attachment may
+report it unavailable. This recovery uses the existing linked-device session
+and does not send a chat message or require re-pairing.
+
 History sync preserves the same supported message text as live reception,
 including WhatsApp Business templates, button messages, and image/video/document
 captions. Shared contact cards are searchable text containing the display name
@@ -947,12 +1019,13 @@ flowchart LR
         HEALTH["/api/health"]
     end
 
-    subgraph MCPTools["MCP Tools (15 total)"]
+    subgraph MCPTools["MCP Tools (16 total)"]
         direction TB
         CONT["Contact Tools<br/>search_contacts, get_contact"]
         MSG["Message Tools<br/>list_messages, send_message, etc."]
         CHAT["Chat Tools<br/>list_chats, get_chat, etc."]
         MEDIA["Media Tools<br/>send_file, download_media, etc."]
+        PRES["Presence Tools<br/>get_typing_state"]
     end
 
     MCPTools -->|HTTP Requests| GoAPI
@@ -1054,6 +1127,12 @@ are preserved.
   supported linked-device client version, which can make older whatsmeow builds
   fail before pairing completes.
 - **QR Code Not Displaying**: Restart the bridge. Check terminal QR code support.
+  If the terminal drawing will not scan, open `store/qr.png` (the bridge writes
+  it on every code and tries to open it once).
+- **Bridge exits saying another bridge holds `store/.bridge.lock`**: A second
+  process on the same store would log the running one out of WhatsApp. Stop the
+  extra process. Personal and business bridges are fine together when each has
+  its own working directory and store.
 - **Phone says "check your connection" after scanning**: WhatsApp answers a scan
   with a `companion_reg_refresh` notification, whatsmeow rotates the pairing
   secret, and the bridge prints a **new** QR code marked `QR code refreshed`.

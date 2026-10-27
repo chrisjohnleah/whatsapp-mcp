@@ -37,13 +37,16 @@ from whatsapp import (
     get_sender_name as whatsapp_get_sender_name,
 )
 from whatsapp import (
+    get_typing_state as whatsapp_get_typing_state,
+)
+from whatsapp import (
     list_chats as whatsapp_list_chats,
 )
 from whatsapp import (
     list_messages as whatsapp_list_messages,
 )
 from whatsapp import (
-    mark_messages_read as whatsapp_mark_messages_read,
+    mark_as_read as whatsapp_mark_as_read,
 )
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -401,27 +404,31 @@ def send_reaction(
 
 
 @mcp.tool()
-def mark_messages_read(
-    message_ids: list[str],
+def mark_as_read(
     chat_jid: str,
+    message_id: str = "",
+    message_ids: list[str] | None = None,
     sender_jid: str = "",
     timestamp: str | None = None,
 ) -> dict[str, Any]:
-    """Mark selected WhatsApp messages as read and send read receipts.
+    """Mark WhatsApp message(s) as read so the sender sees blue ticks / read receipts.
 
-    This is an explicit external side effect. All message IDs must belong to the
-    same chat and sender.
+    Prefer this at the start of a turn over reacting 👀 just to show "seen".
+    For group chats, pass sender_jid (who wrote the message). All IDs in one
+    call must be from the same sender.
 
     Args:
-        message_ids: IDs of the messages to mark as read
-        chat_jid: JID of the chat containing the messages
-        sender_jid: JID or bare phone number of the original sender; required for groups
+        chat_jid: The chat JID (e.g. "12025551234@s.whatsapp.net" or a group JID)
+        message_id: Single message ID to mark read
+        message_ids: Optional list of message IDs (same sender only)
+        sender_jid: Required for groups — full JID of the message author.
+                    Optional in DMs.
         timestamp: Optional RFC 3339 read timestamp; defaults to the current time
 
     Returns:
         A dictionary containing success status and a status message
     """
-    success, status_message = whatsapp_mark_messages_read(message_ids, chat_jid, sender_jid, timestamp)
+    success, status_message = whatsapp_mark_as_read(chat_jid, message_id, message_ids, sender_jid, timestamp)
     return {"success": success, "message": status_message}
 
 
@@ -482,6 +489,35 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
         return {"success": True, "message": "Media downloaded successfully", "file_path": file_path}
     else:
         return {"success": False, "message": "Failed to download media"}
+
+
+@mcp.tool()
+def get_typing_state(chat_jid: str | None = None) -> dict[str, Any]:
+    """Get current typing/composing state for WhatsApp chats.
+
+    Returns contacts who are currently typing or recording a voice message.
+    Useful for detecting when a contact is composing a message before responding.
+
+    The bridge marks itself as "available" on connection so that WhatsApp sends
+    typing notifications. States expire after ~30 seconds if no "paused" event
+    arrives.
+
+    Args:
+        chat_jid: Optional chat JID to filter results. If not provided, returns
+                  all currently-typing contacts across all chats.
+
+    Returns:
+        A dictionary containing:
+        - success: Whether the query succeeded
+        - typing: List of typing states, each with:
+          - chat_jid: The chat where typing is happening
+          - sender_jid: Who is typing
+          - is_typing: Always true (paused states are not returned)
+          - media: "" for text, "audio" for voice recording
+          - updated_at: ISO-8601 timestamp of when typing started/refreshed
+    """
+    typing_states = whatsapp_get_typing_state(chat_jid)
+    return {"success": True, "typing": typing_states}
 
 
 @mcp.tool()

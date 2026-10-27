@@ -1286,7 +1286,6 @@ func TestHandleHistorySync_DMSenderIgnoresParticipant(t *testing.T) {
 		})
 	}
 }
-
 func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) {
 	ms := newTestMessageStore(t)
 	logger := testLogger()
@@ -2576,6 +2575,22 @@ func TestHandleMessage_ReactionWithoutKey_NotStored(t *testing.T) {
 
 // TestReactHandler_MissingFields_Returns400 verifies that the /api/react
 // handler returns 400 when recipient or message_id is absent.
+func TestReactionTargetsUsesLIDAndClearsPhoneToo(t *testing.T) {
+	phone := types.JID{User: "447700900000", Server: types.DefaultUserServer}
+	lid := types.JID{User: "999000000000001", Server: types.HiddenUserServer}
+	add := reactionTargets(phone, lid, false)
+	if len(add) != 1 || add[0].Server != types.HiddenUserServer {
+		t.Fatalf("add = %+v, want only the LID", add)
+	}
+	clear := reactionTargets(phone, lid, true)
+	if len(clear) != 2 || clear[0].Server != types.HiddenUserServer || clear[1].User != phone.User {
+		t.Fatalf("clear = %+v, want LID then phone", clear)
+	}
+	if got := reactionTargets(phone, types.EmptyJID, true); len(got) != 1 || got[0].User != phone.User {
+		t.Fatalf("no lid = %+v", got)
+	}
+}
+
 func TestReactHandler_MissingFields_Returns400(t *testing.T) {
 	const token = "supersecrettoken1234567890abcdef"
 	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
@@ -2979,6 +2994,36 @@ func TestSendHandler_QuotedReplyFields_PassedThrough(t *testing.T) {
 	// Empty recipient → 400
 	if resp.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for empty recipient with quoted fields, got %d", resp.Code)
+	}
+}
+
+func TestInternalProtocolReason(t *testing.T) {
+	leak := "WAKE_RESULT: handled\nSENT: yes\nwhatsapp-business__send_message(content=\"hi\")\n"
+	if got := internalProtocolReason(leak); got == "" {
+		t.Fatalf("expected protocol hit, got empty")
+	}
+	clean := "Got it. Glad that sorted it.\n\n- Webby (Gemma 4 e4b)"
+	if got := internalProtocolReason(clean); got != "" {
+		t.Fatalf("clean customer line blocked: %q", got)
+	}
+}
+
+func TestSendHandler_InternalProtocol_Forbidden(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	body := `{"recipient":"120363402197392919@g.us","message":"WAKE_RESULT: handled\nSENT: yes"}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/send", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for protocol dump, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "outbound blocked") {
+		t.Fatalf("expected blocked message, got %s", resp.Body.String())
 	}
 }
 

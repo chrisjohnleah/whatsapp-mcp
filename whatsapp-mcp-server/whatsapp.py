@@ -3,13 +3,14 @@ import os
 import os.path
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import requests
 
 import audio
+import staff_signoff
 
 # Configuration via environment variables with sensible defaults
 _DEFAULT_BRIDGE_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store")
@@ -507,6 +508,32 @@ def format_messages_list(messages: list[Message], show_chat_info: bool = True) -
     return output
 
 
+# messages.timestamp is written by the bridge with a UTC offset
+# ("2024-01-15 10:30:00.123+02:00"). Comparing it as a raw string against a
+# naive or UTC bound is off by the bridge's offset, so both sides are
+# normalised to UTC in SQL: this expression for the column, _utc_bound() for
+# the parameter. %f keeps millisecond precision so a bound never rounds a
+# message onto the wrong side of the comparison.
+_TIMESTAMP_UTC_SQL = "strftime('%Y-%m-%d %H:%M:%f', messages.timestamp)"
+
+
+def _utc_bound(value: str, field: str) -> str:
+    """Parse an ISO-8601 filter bound and render it as UTC 'YYYY-MM-DD HH:MM:SS.mmm'.
+
+    Naive inputs are read as the MCP server's local time, the same clock the
+    bridge stamps messages with, so "2026-01-01T09:00" means 9am as the user
+    sees it in WhatsApp.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"Invalid date format for '{field}': {value}. Please use ISO-8601 format.")
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    parsed = parsed.astimezone(UTC)
+    return parsed.strftime("%Y-%m-%d %H:%M:%S.") + f"{parsed.microsecond // 1000:03d}"
+
+
 def list_messages(
     after: str | None = None,
     before: str | None = None,
@@ -552,22 +579,12 @@ def list_messages(
 
         # Add filters
         if after:
-            try:
-                after = datetime.fromisoformat(after)
-            except ValueError:
-                raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
-
-            where_clauses.append("messages.timestamp > ?")
-            params.append(after)
+            where_clauses.append(f"{_TIMESTAMP_UTC_SQL} > ?")
+            params.append(_utc_bound(after, "after"))
 
         if before:
-            try:
-                before = datetime.fromisoformat(before)
-            except ValueError:
-                raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
-
-            where_clauses.append("messages.timestamp < ?")
-            params.append(before)
+            where_clauses.append(f"{_TIMESTAMP_UTC_SQL} < ?")
+            params.append(_utc_bound(before, "before"))
 
         if sender_phone_number:
             aliases = _sender_aliases(sender_phone_number)
@@ -591,7 +608,10 @@ def list_messages(
         # Add sorting and pagination
         offset = page * limit
         order = "DESC" if sort_by == "newest" else "ASC"
-        query_parts.append(f"ORDER BY messages.timestamp {order}")
+        # Timestamps carry the bridge host's UTC offset; ordering the raw text is
+        # only chronological while that offset never changes. julianday() orders
+        # on the instant (see also get_message_context / list_chats).
+        query_parts.append(f"ORDER BY julianday(messages.timestamp) {order}")
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
 
@@ -685,8 +705,8 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
             SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.chat_jid = ? AND messages.timestamp < ?
-            ORDER BY messages.timestamp DESC
+            WHERE messages.chat_jid = ? AND julianday(messages.timestamp) < julianday(?)
+            ORDER BY julianday(messages.timestamp) DESC
             LIMIT ?
         """,
             (msg_data[7], msg_data[0], before),
@@ -715,8 +735,8 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
             SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.chat_jid = ? AND messages.timestamp > ?
-            ORDER BY messages.timestamp ASC
+            WHERE messages.chat_jid = ? AND julianday(messages.timestamp) > julianday(?)
+            ORDER BY julianday(messages.timestamp) ASC
             LIMIT ?
         """,
             (msg_data[7], msg_data[0], after),
@@ -820,9 +840,12 @@ def list_chats(
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
 
-        # Add sorting
+        # Add sorting. julianday() keeps mixed timestamp text in real time order.
+        # Name sort uses the resolved display name, not a stored phone-number placeholder.
         order_by = (
-            "chats.last_message_time DESC" if sort_by == "last_active" else "resolved_chat_name(chats.jid, chats.name)"
+            "julianday(chats.last_message_time) DESC"
+            if sort_by == "last_active"
+            else "resolved_chat_name(chats.jid, chats.name)"
         )
         query_parts.append(f"ORDER BY {order_by}")
 
@@ -962,7 +985,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
                 WHERE contact_msg.chat_jid = c.jid
                     AND contact_msg.sender IN ({placeholders})
             ) OR c.jid = ?
-            ORDER BY c.last_message_time DESC
+            ORDER BY julianday(c.last_message_time) DESC
             LIMIT ? OFFSET ?
         """,
             (*aliases, jid, limit, page * limit),
@@ -1022,7 +1045,7 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
             WHERE m.sender IN ({placeholders}) OR c.jid = ?
-            ORDER BY m.timestamp DESC
+            ORDER BY julianday(m.timestamp) DESC
             LIMIT 1
         """,
             (*aliases, jid),
@@ -1170,6 +1193,11 @@ def send_message(
         if not recipient:
             return False, "Recipient must be provided"
 
+        message = staff_signoff.apply_staff_signoff(message, recipient)
+        reason = staff_signoff.internal_protocol_reason(message)
+        if reason:
+            return False, "outbound blocked: internal protocol"
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload: dict[str, Any] = {
             "recipient": recipient,
@@ -1216,6 +1244,11 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> tuple[bool,
 
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
+
+        if caption:
+            caption = staff_signoff.apply_staff_signoff(caption, recipient)
+            if staff_signoff.internal_protocol_reason(caption):
+                return False, "outbound blocked: internal protocol"
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "media_path": media_path}
@@ -1341,25 +1374,50 @@ def send_reaction(
         return False, f"Unexpected error: {str(e)}"
 
 
-def mark_messages_read(
-    message_ids: list[str],
+def mark_as_read(
     chat_jid: str,
+    message_id: str = "",
+    message_ids: list[str] | None = None,
     sender_jid: str = "",
     timestamp: str | None = None,
 ) -> tuple[bool, str]:
-    """Mark selected messages as read through the WhatsApp bridge."""
+    """Mark one or more WhatsApp messages as read (blue ticks / read receipt).
+
+    Args:
+        chat_jid: The chat JID (DM or group).
+        message_id: Single message ID to mark read.
+        message_ids: Optional list of message IDs (same sender only).
+        sender_jid: Required for group chats — JID of who sent the message(s).
+                    Optional in DMs.
+        timestamp: Optional RFC 3339 read timestamp; defaults to now on the bridge.
+
+    Returns:
+        Tuple of (success, status_message).
+    """
     try:
-        normalized_ids = [message_id.strip() for message_id in message_ids]
-        if not normalized_ids or any(not message_id for message_id in normalized_ids):
-            return False, "At least one non-empty message ID must be provided"
         if not chat_jid:
-            return False, "Chat JID must be provided"
+            return False, "chat_jid must be provided"
+
+        ids: list[str] = []
+        if message_ids:
+            ids.extend([mid.strip() for mid in message_ids if mid and mid.strip()])
+        if message_id and message_id.strip():
+            ids.append(message_id.strip())
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for mid in ids:
+            if mid not in seen:
+                seen.add(mid)
+                unique.append(mid)
+        if not unique:
+            return False, "message_id or message_ids must be provided"
         if chat_jid.endswith("@g.us") and not sender_jid:
-            return False, "Sender JID must be provided for group read receipts"
+            return False, "sender_jid must be provided for group read receipts"
 
         payload: dict[str, Any] = {
-            "message_ids": normalized_ids,
             "chat_jid": chat_jid,
+            "message_ids": unique,
         }
         if sender_jid:
             payload["sender_jid"] = sender_jid
@@ -1374,7 +1432,9 @@ def mark_messages_read(
 
         if response.status_code == 200:
             result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
+            if result.get("success"):
+                return True, result.get("message", "Marked as read")
+            return False, result.get("message", "Unknown error")
         return False, f"Error: HTTP {response.status_code} - {response.text}"
 
     except requests.RequestException as e:
@@ -1383,6 +1443,41 @@ def mark_messages_read(
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+
+def get_typing_state(chat_jid: str | None = None) -> list[dict[str, Any]]:
+    """Query inbound typing/composing state from the bridge.
+
+    Args:
+        chat_jid: Optional chat JID to filter results. If None, returns all active typing states.
+
+    Returns:
+        List of typing state dictionaries with chat_jid, sender_jid, is_typing, media, updated_at.
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/typing"
+        params = {}
+        if chat_jid:
+            params["chat_jid"] = chat_jid
+
+        response = requests.get(url, params=params, headers=_bridge_headers())
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success", False):
+                return result.get("typing", [])
+            return []
+        return []
+
+    except requests.RequestException as e:
+        print(f"Request error while getting typing state: {str(e)}")
+        return []
+    except json.JSONDecodeError:
+        print(f"Error parsing typing state response: {response.text}")
+        return []
+    except Exception as e:
+        print(f"Unexpected error while getting typing state: {str(e)}")
+        return []
 
 
 def download_media(message_id: str, chat_jid: str) -> str | None:

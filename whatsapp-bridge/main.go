@@ -12,12 +12,15 @@ import (
 	"math"
 	"math/rand"
 	"mime"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
-	"strconv"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +28,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	"rsc.io/qr"
 
 	"bytes"
 
@@ -42,6 +46,10 @@ import (
 // Whether to forward messages sent by self via webhook.
 // Defaults to true. Override with env FORWARD_SELF=false.
 var forwardSelfMessages = getEnvBool("FORWARD_SELF", true)
+
+// typingStore tracks inbound typing/composing presence across all chats.
+// Initialized in main() before the event handler is attached.
+var typingStore *TypingStore
 
 // autoDownloadMediaEnabled reports whether incoming media is downloaded
 // automatically, including images for webhooks. A false value leaves media to
@@ -713,6 +721,13 @@ func (store *MessageStore) Close() error {
 // names set by inbound handling or history sync. last_message_time is
 // merged monotonically so out-of-order delivery (history sync, backfill)
 // can't move it backwards.
+// Timestamps are stored as go-sqlite3 renders time.Time: local wall clock plus
+// UTC offset ("2026-10-25 01:30:00+01:00"). Comparing two of them as strings is
+// only chronological while the offset never changes; across a DST switch or a
+// host timezone change "01:15:00+00:00" sorts before "01:30:00+01:00" although
+// it is the later instant. Every "is this newer" decision therefore goes
+// through julianday(), which SQLite evaluates on the instant.
+
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
 		`INSERT INTO chats (jid, name, last_message_time)
@@ -722,7 +737,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 			last_message_time = CASE
 				WHEN chats.last_message_time IS NULL THEN excluded.last_message_time
 				WHEN excluded.last_message_time IS NULL THEN chats.last_message_time
-				WHEN excluded.last_message_time > chats.last_message_time THEN excluded.last_message_time
+				WHEN julianday(excluded.last_message_time) > julianday(chats.last_message_time) THEN excluded.last_message_time
 				ELSE chats.last_message_time
 			END`,
 		jid, name, lastMessageTime,
@@ -792,7 +807,7 @@ func (store *MessageStore) MarkChatRead(jid string, readAt time.Time) error {
 			last_read_time = CASE
 				WHEN chats.last_read_time IS NULL THEN excluded.last_read_time
 				WHEN excluded.last_read_time IS NULL THEN chats.last_read_time
-				WHEN excluded.last_read_time > chats.last_read_time THEN excluded.last_read_time
+				WHEN julianday(excluded.last_read_time) > julianday(chats.last_read_time) THEN excluded.last_read_time
 				ELSE chats.last_read_time
 			END`,
 		jid, readAt,
@@ -890,11 +905,17 @@ func (store *MessageStore) MaxMessageTimestamp(chatJID string, ids []string) (ti
 		placeholders[i] = "?"
 		args = append(args, id)
 	}
+	// MAX() would pick the lexicographically largest string, which is not the
+	// latest instant once offsets differ; order on the instant instead.
 	var raw any
 	err := store.db.QueryRow(
-		`SELECT MAX(timestamp) FROM messages WHERE chat_jid = ? AND id IN (`+strings.Join(placeholders, ",")+`)`,
+		`SELECT timestamp FROM messages WHERE chat_jid = ? AND id IN (`+strings.Join(placeholders, ",")+`)
+		 ORDER BY julianday(timestamp) DESC LIMIT 1`,
 		args...,
 	).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return time.Time{}, false, nil
+	}
 	if err != nil {
 		return time.Time{}, false, err
 	}
@@ -1278,6 +1299,27 @@ type ReactRequest struct {
 	FromMe    bool    `json:"from_me"`    // whether the reacted-to message was sent by us
 	SenderJID string  `json:"sender_jid"` // full JID of the reacted-to message's sender
 	Emoji     *string `json:"emoji"`      // reaction emoji; empty string removes the reaction
+}
+
+// reactionTargets is who a reaction must name as the message author.
+// Live group keys use the sender's LID. Callers pass the phone JID they
+// stored. Sending the clear only at the phone JID leaves the eyes on the
+// LID key, which is what Chris sees on his own bubbles.
+// A clear also addresses the phone JID so a reaction added before this
+// mapping comes off.
+func reactionTargets(sender, lid types.JID, clearing bool) []types.JID {
+	sender = sender.ToNonAD()
+	if sender.Server != types.DefaultUserServer || lid.IsEmpty() {
+		return []types.JID{sender}
+	}
+	lid = lid.ToNonAD()
+	if lid.Server != types.HiddenUserServer || lid.User == "" || lid.User == sender.User {
+		return []types.JID{sender}
+	}
+	if !clearing {
+		return []types.JID{lid}
+	}
+	return []types.JID{lid, sender}
 }
 
 // classifyMediaPath maps a file extension to (whatsmeow upload type, MIME
@@ -2360,10 +2402,22 @@ func hasCompleteMediaInfo(url string, mediaKey, fileSHA256, fileEncSHA256 []byte
 	return url != "" && len(mediaKey) != 0 && len(fileSHA256) != 0 && len(fileEncSHA256) != 0 && fileLength != 0
 }
 
+// parseStoredSender turns the messages.sender column into a JID. Live and
+// history rows store the user part only; a value that already contains @ is
+// used as-is. Unresolved values are phone JIDs, which is what the media-retry
+// receipt expects after resolveUserJID.
+func parseStoredSender(sender string) (types.JID, error) {
+	if !strings.Contains(sender, "@") {
+		sender += "@" + types.DefaultUserServer
+	}
+	return types.ParseJID(sender)
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message including timestamp
-	var mediaType, url string
+	var mediaType, url, sender string
+	var fromMe bool
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
 	var timestamp time.Time
@@ -2371,9 +2425,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	// Get media info AND timestamp from the database
 	err = messageStore.db.QueryRow(
-		"SELECT media_type, url, media_key, file_sha256, file_enc_sha256, file_length, timestamp FROM messages WHERE id = ? AND chat_jid = ?",
+		"SELECT media_type, url, media_key, file_sha256, file_enc_sha256, file_length, timestamp, sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
 		messageID, chatJID,
-	).Scan(&mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength, &timestamp)
+	).Scan(&mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength, &timestamp, &sender, &fromMe)
 
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
@@ -2446,8 +2500,30 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := downloadMediaData(client, downloader)
+	// Download the media. A dead CDN link (403/404/410) asks the phone for a
+	// fresh path and retries once. downloadMediaData stays the seam tests stub.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
+	defer cancel()
+	mediaData, err := downloadWithRefresh(ctx, downloader,
+		func(_ context.Context, media *MediaDownloader) ([]byte, error) {
+			return downloadMediaData(client, media)
+		},
+		func(ctx context.Context) (string, error) {
+			chat, parseErr := types.ParseJID(chatJID)
+			if parseErr != nil {
+				return "", parseErr
+			}
+			participant, parseErr := parseStoredSender(sender)
+			if parseErr != nil {
+				return "", parseErr
+			}
+			info := &types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: participant, IsFromMe: fromMe, IsGroup: chat.Server == types.GroupServer}, ID: messageID, Timestamp: timestamp}
+			return mediaRefresh.request(ctx, info, mediaKey, client.SendMediaRetryReceipt)
+		},
+		func(path string) error {
+			_, saveErr := messageStore.db.ExecContext(ctx, "UPDATE messages SET url = ? WHERE id = ? AND chat_jid = ?", path, messageID, chatJID)
+			return saveErr
+		})
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -2490,6 +2566,34 @@ func extractDirectPathFromURL(url string) string {
 	// whatsmeow's Download rebuilds the URL as host + directPath + "&hash=..."
 	// and the CDN returns 403 if the auth params are missing.
 	return "/" + parts[1]
+}
+
+// internalProtocolRe matches staff-wake footers and fake MCP tool calls.
+// Staff-wake protocol must never be sent as a chat message.
+var internalProtocolRe = regexp.MustCompile(`(?im)` +
+	`(^WAKE_RESULT\s*:)` +
+	`|(^SENT\s*:\s*(yes|no)\b)` +
+	`|(^VERIFIED\s*:)` +
+	`|(^OPEN_ITEMS\s*:)` +
+	`|(^ARTIFACTS\s*:)` +
+	`|(^OBJECTIVE\s*:)` +
+	`|(^EVIDENCE\s*:)` +
+	`|(whatsapp-business__)` +
+	`|(whatsapp__send)` +
+	`|(send_message\s*\()` +
+	`|(quoted_message_id\s*=)`)
+
+func internalProtocolReason(message string) string {
+	m := internalProtocolRe.FindStringSubmatch(message)
+	if m == nil {
+		return ""
+	}
+	for _, g := range m[1:] {
+		if g != "" {
+			return g
+		}
+	}
+	return strings.TrimSpace(m[0])
 }
 
 // Start a REST API server to expose the WhatsApp client functionality.
@@ -2562,6 +2666,20 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 		if req.Message == "" && req.MediaPath == "" {
 			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+			return
+		}
+
+		// Staff-wake text was pasted into a customer chat via /api/send.
+		// Never deliver staff-wake protocol.
+		if reason := internalProtocolReason(req.Message); reason != "" {
+			fmt.Printf("← /api/send blocked internal protocol reason=%q recipient=%q\n",
+				reason, req.Recipient)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "outbound blocked: internal protocol",
+			})
 			return
 		}
 
@@ -2756,11 +2874,31 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			}
 			senderJID = chatJID
 		}
-		msg := client.BuildReaction(chatJID, senderJID, req.MessageID, *req.Emoji)
+		targets := []types.JID{senderJID}
+		if client.Store != nil && client.Store.LIDs != nil {
+			if lid, err := client.Store.LIDs.GetLIDForPN(r.Context(), senderJID); err == nil {
+				targets = reactionTargets(senderJID, lid, *req.Emoji == "")
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		if _, err := client.SendMessage(context.Background(), chatJID, msg); err != nil {
+		var sendErr error
+		sent := 0
+		for _, participant := range targets {
+			msg := client.BuildReaction(chatJID, participant, req.MessageID, *req.Emoji)
+			if _, err := client.SendMessage(context.Background(), chatJID, msg); err != nil {
+				sendErr = err
+				fmt.Printf("react failed participant=%s msg=%s: %v\n", participant, req.MessageID, err)
+				continue
+			}
+			sent++
+		}
+		if sent == 0 {
 			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			errText := "react failed"
+			if sendErr != nil {
+				errText = sendErr.Error()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": errText})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
@@ -2831,85 +2969,117 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		})
 	}))
 
-	// Handler for sending typing indicator
+	// Handler for typing indicators: GET to query inbound state, POST to send outbound.
 	mux.HandleFunc("/api/typing", auth(func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req struct {
-			Recipient string `json:"recipient"`
-			IsTyping  bool   `json:"is_typing"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		// Create JID for recipient
-		var recipientJID types.JID
-		var err error
-
-		// Check if recipient is a JID
-		if strings.Contains(req.Recipient, "@") {
-			recipientJID, err = types.ParseJID(req.Recipient)
-			if err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"success": false,
-					"message": fmt.Sprintf("Error parsing JID: %v", err),
-				})
-				return
-			}
-		} else {
-			// Create JID from phone number
-			recipientJID = types.JID{
-				User:   req.Recipient,
-				Server: "s.whatsapp.net",
-			}
-		}
-
-		// Determine the chat presence state
-		var state types.ChatPresence
-		if req.IsTyping {
-			state = types.ChatPresenceComposing
-		} else {
-			state = types.ChatPresencePaused
-		}
-
-		// Send the chat presence update
-		err = client.SendChatPresence(context.Background(), recipientJID, state, types.ChatPresenceMediaText)
-
-		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
-		// Send response
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"message": fmt.Sprintf("Failed to send typing indicator: %v", err),
-			})
-		} else {
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": true,
-				"message": fmt.Sprintf("Typing indicator set to %v", req.IsTyping),
-			})
+		switch r.Method {
+		case http.MethodGet:
+			// Query inbound typing state.
+			chatJID := r.URL.Query().Get("chat_jid")
+
+			// Response structure.
+			type TypingResponse struct {
+				ChatJID   string `json:"chat_jid"`
+				SenderJID string `json:"sender_jid"`
+				IsTyping  bool   `json:"is_typing"`
+				Media     string `json:"media,omitempty"`
+				UpdatedAt string `json:"updated_at"`
+			}
+			type GetTypingResponse struct {
+				Success bool             `json:"success"`
+				Typing  []TypingResponse `json:"typing"`
+			}
+
+			var states []*TypingState
+			if chatJID != "" {
+				states = typingStore.GetForChat(chatJID)
+			} else {
+				states = typingStore.ListActive()
+			}
+
+			resp := GetTypingResponse{Success: true, Typing: make([]TypingResponse, 0, len(states))}
+			for _, s := range states {
+				resp.Typing = append(resp.Typing, TypingResponse{
+					ChatJID:   s.ChatJID,
+					SenderJID: s.SenderJID,
+					IsTyping:  s.IsTyping,
+					Media:     s.Media,
+					UpdatedAt: s.UpdatedAt.Format(time.RFC3339),
+				})
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+
+		case http.MethodPost:
+			// Send outbound typing indicator (existing behavior).
+			var req struct {
+				Recipient string `json:"recipient"`
+				IsTyping  bool   `json:"is_typing"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "Invalid request format", http.StatusBadRequest)
+				return
+			}
+
+			if req.Recipient == "" {
+				http.Error(w, "Recipient is required", http.StatusBadRequest)
+				return
+			}
+
+			var recipientJID types.JID
+			var err error
+
+			if strings.Contains(req.Recipient, "@") {
+				recipientJID, err = types.ParseJID(req.Recipient)
+				if err != nil {
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"success": false,
+						"message": fmt.Sprintf("Error parsing JID: %v", err),
+					})
+					return
+				}
+			} else {
+				recipientJID = types.JID{
+					User:   req.Recipient,
+					Server: "s.whatsapp.net",
+				}
+			}
+
+			var state types.ChatPresence
+			if req.IsTyping {
+				state = types.ChatPresenceComposing
+			} else {
+				state = types.ChatPresencePaused
+			}
+
+			err = client.SendChatPresence(context.Background(), recipientJID, state, types.ChatPresenceMediaText)
+
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to send typing indicator: %v", err),
+				})
+			} else {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": true,
+					"message": fmt.Sprintf("Typing indicator set to %v", req.IsTyping),
+				})
+			}
+
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	}))
 
 	return mux
 }
 
+// startRESTServer serves on a listener that main already bound (see
+// bindBridgePort). Binding is not done here: by this point the WhatsApp session
+// is live, so discovering a port clash now would be too late to back out of it
+// without having already evicted a running bridge.
+//
 // Requests use the current client after a revoked device is replaced. Existing
 // in-flight requests can finish against the already disconnected previous client.
 func newManagedRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string, connection *connectionManager) http.Handler {
@@ -2928,17 +3098,16 @@ func newManagedRESTMux(client *whatsmeow.Client, messageStore *MessageStore, por
 		handler.ServeHTTP(w, r)
 	})
 }
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string, connection *connectionManager) {
+
+func startRESTServer(listener net.Listener, client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string, connection *connectionManager) {
 	handler := newManagedRESTMux(client, messageStore, port, token, allowedMediaRoots, connection)
 
-	// Start the server with proper timeouts. Bind to loopback so the bridge is
-	// not reachable from the LAN; MCP clients talk to it over localhost.
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// The listener is already bound to loopback, so the bridge is not reachable
+	// from the LAN; MCP clients talk to it over localhost.
+	fmt.Printf("Starting REST API server on %s...\n", listener.Addr())
 
 	// Create server with timeouts for stability
 	server := &http.Server{
-		Addr:         serverAddr,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second, // Longer for media downloads
 		IdleTimeout:  120 * time.Second,
@@ -2947,7 +3116,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -3018,6 +3187,9 @@ func main() {
 
 	logger.Infof("%s", webhookStartupMessage(forwardSelfMessages))
 
+	// Initialize typing store for inbound presence tracking.
+	typingStore = NewTypingStore(DefaultTypingExpiry)
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
@@ -3027,6 +3199,28 @@ func main() {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
+
+	// Claim the store and the REST port before opening the session database or
+	// dialling WhatsApp. A second bridge that gets as far as connecting would
+	// evict the running one from the shared device session (see singleton.go).
+	port, err := resolveBridgePort()
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
+	}
+	lockFile, err := acquireBridgeLock("store")
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
+	}
+	defer func() { _ = lockFile.Close() }()
+
+	restListener, err := bindBridgePort(port)
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
+	}
+	logger.Infof("Bridge lock acquired; REST API bound to %s", restListener.Addr())
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -3092,6 +3286,11 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	// Phone replies can use LIDs even when the stored chat uses a phone JID.
+	mediaRefresh.normalizeChat = func(chat types.JID) types.JID {
+		return resolveUserJID(client, chat, types.EmptyJID)
+	}
+	client.AddEventHandler(mediaRefresh.handleEvent)
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
@@ -3111,19 +3310,9 @@ func main() {
 		return
 	}
 
-	// Resolve the REST API port. Pure env parsing with no dependency on the
-	// WhatsApp connection, so it's safe to do this early alongside the token
-	// load below — and failing fast here means we don't run a QR-pairing
-	// flow only to error out on an invalid port afterwards.
-	port := 8080
-	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
-		v, err := strconv.Atoi(p)
-		if err != nil || v < 1 || v > 65535 {
-			logger.Errorf("Invalid WHATSAPP_BRIDGE_PORT=%q, must be 1-65535", p)
-			return
-		}
-		port = v
-	}
+	// Port and the loopback listener were claimed above, before the session
+	// database was opened. The token still has to be ready before the event
+	// handler is registered.
 
 	// Load (or generate on first run) the bearer token used to authenticate
 	// REST callers, and attach it to outbound webhook POSTs so the hub's
@@ -3161,8 +3350,14 @@ func main() {
 	}
 	var registerEvents func(*whatsmeow.Client)
 	connection.preparePairing = func() { connection.replaceDeletedClient(container.NewDevice, registerEvents) }
-	if info, err := os.Stdout.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
-		connection.renderQR = func(code string) { qrterminal.GenerateHalfBlock(code, qrterminal.L, os.Stdout) }
+	qrPNGAnnounced := false
+	connection.renderQR = func(code string) {
+		if info, err := os.Stdout.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
+			qrterminal.GenerateHalfBlock(code, qrterminal.L, os.Stdout)
+		}
+		// Launchd has no terminal. Always write store/qr.png so a camera can scan it.
+		writeQRPNG(code, !qrPNGAnnounced)
+		qrPNGAnnounced = true
 	}
 
 	// Setup event handling for messages and history sync
@@ -3260,6 +3455,34 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("✓ Successfully connected to WhatsApp servers")
+			// Mark self as available so WhatsApp sends us typing notifications.
+			// Without this, events.ChatPresence is never emitted.
+			if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+				logger.Warnf("Failed to send presence available: %v", err)
+			} else {
+				logger.Infof("Marked self as available for typing notifications")
+			}
+
+		case *events.ChatPresence:
+			// Inbound typing/composing state from a contact.
+			chatJID := v.Chat.String()
+			senderJID := v.Sender.String()
+			isTyping := v.State == types.ChatPresenceComposing
+			media := ""
+			if v.Media == types.ChatPresenceMediaAudio {
+				media = "audio"
+			}
+
+			_, changed := typingStore.Update(chatJID, senderJID, isTyping, media)
+			if changed {
+				state := "paused"
+				if isTyping {
+					state = "composing"
+				}
+				logger.Debugf("Typing state: %s is %s in %s", senderJID, state, chatJID)
+				// Forward to webhook.
+				SendTypingWebhook(chatJID, senderJID, isTyping, media)
+			}
 
 		case *events.LoggedOut:
 			logger.Warnf("⚠️  Device logged out, please scan QR code to log in again")
@@ -3282,7 +3505,7 @@ func main() {
 	}
 	logger.Infof("Allowed media roots: %v", allowedMediaRoots)
 
-	startRESTServer(client, messageStore, port, bridgeToken, allowedMediaRoots, connection)
+	startRESTServer(restListener, client, messageStore, port, bridgeToken, allowedMediaRoots, connection)
 	connection.start()
 	defer connection.close()
 
@@ -3548,7 +3771,6 @@ func newestStorableHistoryTimestamp(messages []*waProto.HistorySyncMsg) (time.Ti
 	}
 	return newest, found
 }
-
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	// Log every history sync event with its shape. Different sync types
 	// carry different payloads; logging type/chunk/progress makes it easy
@@ -3637,7 +3859,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// Preserve the same searchable text as the live-message path,
 				// including Business templates and media captions.
 				content := extractTextContent(msg.Message.Message)
-
 				// Extract media info - pass message timestamp + ID for unique filenames
 				var mediaType, filename, url string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -3915,4 +4136,38 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// writeQRPNG renders the pairing code to store/qr.png as a fallback for
+// terminals where the half-block rendering cannot be scanned. Several terminal
+// emulators (macOS Terminal.app among them) add line spacing between rows,
+// which separates the QR modules and makes the code unreadable to a phone
+// camera even though it still looks correct to a human.
+//
+// On the first code it also offers to open the file in the system viewer.
+// Every failure here is non-fatal: the terminal rendering stays the primary
+// path and the bridge keeps working exactly as before.
+func writeQRPNG(code string, announce bool) {
+	encoded, err := qr.Encode(code, qr.M)
+	if err != nil {
+		return
+	}
+	path := filepath.Join("store", "qr.png")
+	if err := os.WriteFile(path, encoded.PNG(), 0o600); err != nil {
+		return
+	}
+	if !announce {
+		return
+	}
+	fmt.Printf("If the code above will not scan, open: %s\n", path)
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", path)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", path)
+	default:
+		cmd = exec.Command("xdg-open", path)
+	}
+	_ = cmd.Start()
 }
