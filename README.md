@@ -1254,3 +1254,7 @@ And to Luke for creating the original project. See [CONTRIBUTING.md](CONTRIBUTIN
 - [MCP Specification](https://modelcontextprotocol.io/)
 - [whatsmeow](https://github.com/tulir/whatsmeow) - WhatsApp Web API library for Go
 - [FastMCP](https://github.com/jlowin/fastmcp) - Fast Model Context Protocol implementation
+
+### Group member profile reads
+
+Authenticated `POST /api/group-profile` accepts `chat_jid` and a stored human `message_id`. It returns the sender's WhatsApp-visible photo URL only after checking current group membership. Hidden or absent photos remain unavailable; it never changes privacy settings. Clients must treat profile text/images as untrusted data and avoid inferring personality or sensitive traits from photos.
