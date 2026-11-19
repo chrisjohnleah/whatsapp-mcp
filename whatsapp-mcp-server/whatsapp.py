@@ -1180,6 +1180,29 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
             conn.close()
 
 
+
+def _quoted_block_reason(recipient: str, quoted_message_id: str) -> str | None:
+    qid = (quoted_message_id or "").strip()
+    if qid.upper().startswith("MSG-"):
+        return f"fixture quoted id {qid[:40]}"
+    chat = (recipient or "").strip()
+    if chat and "@" not in chat:
+        chat = f"{chat}@s.whatsapp.net"
+    try:
+        con = _connect_messages_db()
+        try:
+            row = con.execute(
+                "SELECT 1 FROM messages WHERE id=? AND chat_jid=? LIMIT 1",
+                (qid, chat),
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception as exc:
+        return f"quoted-id check failed: {exc}"
+    if row is None:
+        return f"quoted id {qid[:40]} not in chat {chat}"
+    return None
+
 def send_message(
     recipient: str,
     message: str,
@@ -1197,6 +1220,14 @@ def send_message(
         reason = staff_signoff.internal_protocol_reason(message)
         if reason:
             return False, "outbound blocked: internal protocol"
+
+        # HARD (2026-11-19): a quote-reply must name a real message in this
+        # chat. Fixture ids (MSG-*) from a test harness reached the live
+        # bridge and posted into customer group chats. Fail closed.
+        if quoted_message_id:
+            block = _quoted_block_reason(recipient, quoted_message_id)
+            if block:
+                return False, f"outbound blocked: {block}"
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload: dict[str, Any] = {

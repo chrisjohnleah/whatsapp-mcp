@@ -236,10 +236,24 @@ def test_send_message_blocks_internal_protocol(monkeypatch):
     assert calls == []
 
 
-def test_send_message_with_quoted_reply_includes_quote_fields(monkeypatch):
+def test_send_message_with_quoted_reply_includes_quote_fields(monkeypatch, tmp_path):
     """send_message passes quoted_message_id, quoted_sender_jid, quoted_content to /api/send."""
     calls = []
     monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
+
+    # The outbound guard requires the quoted id to be a real message in
+    # that chat (2026-11-19 fixture burst); seed it in a tmp store.
+    import sqlite3
+
+    db = tmp_path / "messages.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE messages(id TEXT, chat_jid TEXT)")
+    con.execute(
+        "INSERT INTO messages VALUES('3AORIGINAL0000001','12025551234@s.whatsapp.net')"
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(whatsapp, "MESSAGES_DB_PATH", str(db))
 
     def fake_post(url, json, headers=None):
         calls.append({"url": url, "json": json, "headers": headers})
@@ -321,3 +335,21 @@ def test_send_message_without_mentions_omits_mentions_field(monkeypatch):
 
     payload = calls[0]["json"]
     assert "mentions" not in payload
+
+
+def test_send_message_blocks_fixture_quoted_id(monkeypatch):
+    """A fixture quoted id (MSG-*) must never reach the bridge (2026-11-19)."""
+    monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
+
+    def fake_post(url, json, headers=None):  # pragma: no cover - must not run
+        raise AssertionError("bridge called for a fixture-quoted send")
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+
+    success, message = whatsapp.send_message(
+        "12025551234@s.whatsapp.net",
+        "Great point!",
+        quoted_message_id="MSG-p01",
+    )
+    assert success is False
+    assert "outbound blocked" in message
