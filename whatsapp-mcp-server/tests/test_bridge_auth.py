@@ -353,3 +353,17 @@ def test_send_message_blocks_fixture_quoted_id(monkeypatch):
     )
     assert success is False
     assert "outbound blocked" in message
+
+
+def test_send_message_blocked_for_readonly_seat(monkeypatch):
+    """WA_SEND_DISABLED=1 makes a verifier seat incapable of sending."""
+    monkeypatch.setenv("WA_SEND_DISABLED", "1")
+
+    def fake_post(url, json, headers=None):  # pragma: no cover - must not run
+        raise AssertionError("bridge called from a read-only seat")
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+
+    success, message = whatsapp.send_message("12025551234@s.whatsapp.net", "Hello!")
+    assert success is False
+    assert "WA_SEND_DISABLED" in message

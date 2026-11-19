@@ -1181,6 +1181,10 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
 
 
 
+def _send_disabled() -> bool:
+    """Verifier/judge seats are read-only by capability, not by brief."""
+    return os.getenv("WA_SEND_DISABLED") == "1"
+
 def _quoted_block_reason(recipient: str, quoted_message_id: str) -> str | None:
     qid = (quoted_message_id or "").strip()
     if qid.upper().startswith("MSG-"):
@@ -1215,6 +1219,9 @@ def send_message(
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
+
+        if _send_disabled():
+            return False, "outbound blocked: WA_SEND_DISABLED (read-only seat)"
 
         message = staff_signoff.apply_staff_signoff(message, recipient)
         reason = staff_signoff.internal_protocol_reason(message)
@@ -1276,6 +1283,9 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> tuple[bool,
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
 
+        if _send_disabled():
+            return False, "outbound blocked: WA_SEND_DISABLED (read-only seat)"
+
         if caption:
             caption = staff_signoff.apply_staff_signoff(caption, recipient)
             if staff_signoff.internal_protocol_reason(caption):
@@ -1314,6 +1324,9 @@ def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
 
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
+
+        if _send_disabled():
+            return False, "outbound blocked: WA_SEND_DISABLED (read-only seat)"
 
         converted_path: str | None = None
         if not media_path.endswith(".ogg"):
@@ -1377,6 +1390,8 @@ def send_reaction(
             return False, "Recipient must be provided"
         if not message_id:
             return False, "Message ID must be provided"
+        if _send_disabled():
+            return False, "outbound blocked: WA_SEND_DISABLED (read-only seat)"
 
         url = f"{WHATSAPP_API_BASE_URL}/react"
         payload: dict[str, Any] = {
