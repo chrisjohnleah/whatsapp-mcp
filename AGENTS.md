@@ -75,6 +75,8 @@ uv run ruff format .        # format
 
 For PR creation, hosted review, CI, and merge readiness, use the installed `babysit` skill (`~/.autovault/skills/babysit/SKILL.md`) as the canonical procedure.
 
+CI runs the checks that match the diff. Python lint and tests run when `whatsapp-mcp-server/**` changes. Go lint and build run when `whatsapp-bridge/**` changes. Docs-only pull requests run version consistency and skip the heavy jobs. Pushes to `main` run version consistency only. CodeQL and the dependency audits run weekly and on pull requests that touch the matching code, not on every push to `main`. `dependabot[bot]` skips the heavy jobs. Release Please is unchanged.
+
 ## Environment variables
 
 | Variable | Default | Purpose |

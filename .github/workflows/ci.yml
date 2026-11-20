@@ -9,7 +9,65 @@ on:
     types: [checks_requested]
   workflow_dispatch:
 
+# Cancel a superseded run of this workflow on the same ref. Release Please
+# stays out of this group so a CI run cannot cancel a release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Job id is `changes` so heavy jobs can `needs: changes`.
+  # Push to main skips this job; version-consistency is the light main check.
+  # workflow_dispatch forces both filters on so a manual run still executes
+  # the full matrix. pull_request uses the files API (no checkout).
+  # merge_group diffs with git, so that event checks out full history.
+  changes:
+    name: Detect changes
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      python: ${{ steps.resolve.outputs.python }}
+      go: ${{ steps.resolve.outputs.go }}
+    steps:
+      - name: Checkout for merge queue diff
+        if: github.event_name == 'merge_group'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: "0"
+
+      - name: Filter changed paths
+        id: filter
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            python:
+              - 'whatsapp-mcp-server/**'
+            go:
+              - 'whatsapp-bridge/**'
+
+      - name: Resolve change outputs
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PYTHON: ${{ steps.filter.outputs.python }}
+          GO: ${{ steps.filter.outputs.go }}
+        run: |
+          python=false
+          go=false
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            python=true
+            go=true
+          else
+            [ "$PYTHON" = "true" ] && python=true
+            [ "$GO" = "true" ] && go=true
+          fi
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
   version-consistency:
     name: Version Consistency
     runs-on: ubuntu-latest
@@ -23,8 +81,18 @@ jobs:
 
   python-lint:
     name: Python Lint
+    needs: changes
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.changes.result != 'success' || (github.actor != 'dependabot[bot]' && needs.changes.outputs.python == 'true')) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Guard change detection
+        if: needs.changes.result != 'success'
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "Change detection did not succeed (${RESULT})." >&2
+          exit 1
+
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10
       - name: Install dependencies
@@ -43,8 +111,18 @@ jobs:
 
   go-lint:
     name: Go Lint
+    needs: changes
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.changes.result != 'success' || (github.actor != 'dependabot[bot]' && needs.changes.outputs.go == 'true')) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Guard change detection
+        if: needs.changes.result != 'success'
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "Change detection did not succeed (${RESULT})." >&2
+          exit 1
+
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
@@ -57,8 +135,18 @@ jobs:
 
   go-build:
     name: Go Build
+    needs: changes
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.changes.result != 'success' || (github.actor != 'dependabot[bot]' && needs.changes.outputs.go == 'true')) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Guard change detection
+        if: needs.changes.result != 'success'
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "Change detection did not succeed (${RESULT})." >&2
+          exit 1
+
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
@@ -70,8 +158,18 @@ jobs:
 
   python-test:
     name: Python Tests
+    needs: changes
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.changes.result != 'success' || (github.actor != 'dependabot[bot]' && needs.changes.outputs.python == 'true')) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Guard change detection
+        if: needs.changes.result != 'success'
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "Change detection did not succeed (${RESULT})." >&2
+          exit 1
+
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10
       - name: Install dependencies
