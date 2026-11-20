@@ -3,23 +3,86 @@ name: Security
 on:
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
 
+# Same cancel rule as CI. A main push does not start this workflow; CodeQL
+# and the audits run on the weekly schedule and on pull requests that touch
+# the matching code.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   security-events: write
 
 jobs:
+  changes:
+    name: Detect security changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      python: ${{ steps.resolve.outputs.python }}
+      go: ${{ steps.resolve.outputs.go }}
+    steps:
+      - name: Checkout for merge queue diff
+        if: github.event_name == 'merge_group'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: "0"
+
+      - name: Filter changed paths
+        id: filter
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            python:
+              - 'whatsapp-mcp-server/**'
+            go:
+              - 'whatsapp-bridge/**'
+
+      # Weekly and manual runs scan both languages. A docs-only pull request
+      # leaves both outputs false, so the heavy jobs stay skipped.
+      - name: Resolve change outputs
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PYTHON: ${{ steps.filter.outputs.python }}
+          GO: ${{ steps.filter.outputs.go }}
+        run: |
+          python=false
+          go=false
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            python=true
+            go=true
+          else
+            [ "$PYTHON" = "true" ] && python=true
+            [ "$GO" = "true" ] && go=true
+          fi
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
   codeql-python:
     name: CodeQL Analysis (Python)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || (github.actor != 'dependabot[bot]' && needs.changes.outputs.python == 'true')) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Guard change detection
+        if: needs.changes.result != 'success'
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "Change detection did not succeed (${RESULT})." >&2
+          exit 1
+
       - uses: actions/checkout@v7
 
       - name: Initialize CodeQL
@@ -35,8 +98,18 @@ jobs:
 
   codeql-go:
     name: CodeQL Analysis (Go)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || (github.actor != 'dependabot[bot]' && needs.changes.outputs.go == 'true')) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Guard change detection
+        if: needs.changes.result != 'success'
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "Change detection did not succeed (${RESULT})." >&2
+          exit 1
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7
@@ -56,8 +129,18 @@ jobs:
 
   python-audit:
     name: Python Dependency Audit
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || (github.actor != 'dependabot[bot]' && needs.changes.outputs.python == 'true')) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Guard change detection
+        if: needs.changes.result != 'success'
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "Change detection did not succeed (${RESULT})." >&2
+          exit 1
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
@@ -78,8 +161,18 @@ jobs:
 
   bandit:
     name: Bandit Security Scan
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || (github.actor != 'dependabot[bot]' && needs.changes.outputs.python == 'true')) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Guard change detection
+        if: needs.changes.result != 'success'
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "Change detection did not succeed (${RESULT})." >&2
+          exit 1
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
@@ -95,8 +188,18 @@ jobs:
 
   govulncheck:
     name: Go Vulnerability Check
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || (github.actor != 'dependabot[bot]' && needs.changes.outputs.go == 'true')) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Guard change detection
+        if: needs.changes.result != 'success'
+        env:
+          RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "Change detection did not succeed (${RESULT})." >&2
+          exit 1
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7

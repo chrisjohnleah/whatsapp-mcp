@@ -47,7 +47,7 @@ These areas accept new PRs and issues. Bugfixes here are always welcome.
 
 - Reproducible builds.
 - Conventional commits + release-please.
-- Lint, test, security scans on every PR.
+- Lint, test, and security scans on pull requests that change the matching Python or Go code.
 
 ## Out of scope
 
